@@ -5,6 +5,11 @@ on:
     branches:
       - main
   workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "If true, do not push commits to child repos"
+        required: false
+        default: "false"
 
 permissions:
   contents: read
@@ -32,6 +37,9 @@ jobs:
           SYNC_TOKEN: ${{ secrets.SYNC_TOKEN }}
         run: |
           set -euo pipefail
+
+          DRY_RUN="${{ github.event.inputs.dry_run || 'false' }}"
+          echo "dry_run=${DRY_RUN}"
 
           if [ -z "${SYNC_TOKEN:-}" ]; then
             echo "SYNC_TOKEN secret is missing."
@@ -106,11 +114,15 @@ jobs:
               git config user.name "boiler-sync-bot"
               git config user.email "boiler-sync-bot@users.noreply.github.com"
               git commit -m "Sync from orgpb/boiler@${BOILER_SHA}"
-              git push origin main
-              echo "Pushed sync to ${REPO}"
+
+              if [ "${DRY_RUN}" = "true" ]; then
+                echo "DRY RUN: would push to ${REPO}, but skipping git push."
+              else
+                git push origin main
+                echo "Pushed sync to ${REPO}"
+              fi
             fi
             popd >/dev/null
 
             rm -rf "${WORKDIR}"
           done
-

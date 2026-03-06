@@ -1,0 +1,116 @@
+name: Sync boiler to child repos
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout boiler repo
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install yq
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo wget -qO /usr/local/bin/yq https://github.com/mikefarah/yq/releases/latest/download/yq_linux_amd64
+          sudo chmod +x /usr/local/bin/yq
+          yq --version
+
+      - name: Sync targets
+        shell: bash
+        env:
+          SYNC_TOKEN: ${{ secrets.SYNC_TOKEN }}
+        run: |
+          set -euo pipefail
+
+          if [ -z "${SYNC_TOKEN:-}" ]; then
+            echo "SYNC_TOKEN secret is missing."
+            exit 1
+          fi
+
+          CONFIG=".github/boiler-sync.yml"
+          if [ ! -f "${CONFIG}" ]; then
+            echo "Missing ${CONFIG}"
+            exit 1
+          fi
+
+          TARGET_COUNT="$(yq '.targets | length' "${CONFIG}")"
+          echo "Found ${TARGET_COUNT} target(s)."
+
+          BOILER_SHA="$(git rev-parse HEAD)"
+          echo "Boiler SHA: ${BOILER_SHA}"
+
+          for i in $(seq 0 $((TARGET_COUNT - 1))); do
+            NAME="$(yq -r ".targets[$i].name" "${CONFIG}")"
+            REPO="$(yq -r ".targets[$i].repo" "${CONFIG}")"
+
+            echo "----"
+            echo "Target: ${NAME}"
+            echo "Repo:   ${REPO}"
+
+            WORKDIR="$(mktemp -d)"
+            echo "Workdir: ${WORKDIR}"
+
+            echo "Cloning child repo..."
+            git clone "https://x-access-token:${SYNC_TOKEN}@github.com/${REPO}.git" "${WORKDIR}/child"
+
+            pushd "${WORKDIR}/child" >/dev/null
+
+            # Ensure we're on main (adjust if child default branch differs)
+            git checkout main || git checkout -b main
+
+            # Remove existing boiler folder (managed area)
+            rm -rf boiler
+            mkdir -p boiler
+
+            popd >/dev/null
+
+            PATH_COUNT="$(yq ".targets[$i].paths | length" "${CONFIG}")"
+            echo "Paths to sync: ${PATH_COUNT}"
+
+            for j in $(seq 0 $((PATH_COUNT - 1))); do
+              SRC_PATH="$(yq -r ".targets[$i].paths[$j]" "${CONFIG}")"
+              echo "Syncing path: ${SRC_PATH}"
+
+              if [ ! -e "${SRC_PATH}" ]; then
+                echo "ERROR: Source path does not exist in boiler repo: ${SRC_PATH}"
+                exit 1
+              fi
+
+              # Copy into child under boiler/<SRC_PATH>
+              mkdir -p "${WORKDIR}/child/boiler/$(dirname "${SRC_PATH}")"
+              rsync -a --delete "${SRC_PATH}" "${WORKDIR}/child/boiler/$(dirname "${SRC_PATH}")/"
+            done
+
+            # Write marker file
+            echo "source_repo=orgpb/boiler" > "${WORKDIR}/child/boiler/.boiler-source"
+            echo "source_sha=${BOILER_SHA}" >> "${WORKDIR}/child/boiler/.boiler-source"
+            echo "synced_at=$(date -u +\"%Y-%m-%dT%H:%M:%SZ\")" >> "${WORKDIR}/child/boiler/.boiler-source"
+
+            pushd "${WORKDIR}/child" >/dev/null
+            git add -A
+
+            if git diff --cached --quiet; then
+              echo "No changes to commit for ${REPO}"
+            else
+              git config user.name "boiler-sync-bot"
+              git config user.email "boiler-sync-bot@users.noreply.github.com"
+              git commit -m "Sync from orgpb/boiler@${BOILER_SHA}"
+              git push origin main
+              echo "Pushed sync to ${REPO}"
+            fi
+            popd >/dev/null
+
+            rm -rf "${WORKDIR}"
+          done
+

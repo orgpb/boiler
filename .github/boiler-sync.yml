@@ -2,11 +2,9 @@ targets:
   - name: new-ibu
     repo: orgpb/new-ibu
     paths:
-      - commons
       - ibu
 
   - name: new-brands
     repo: orgpb/new-brands
     paths:
-      - commons
       - brands

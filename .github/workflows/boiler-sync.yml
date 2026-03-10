@@ -5,11 +5,6 @@ on:
     branches:
       - main
   workflow_dispatch:
-    inputs:
-      dry_run:
-        description: "If true, do not push commits to child repos"
-        required: false
-        default: "false"
 
 permissions:
   contents: read
@@ -38,9 +33,6 @@ jobs:
         run: |
           set -euo pipefail
 
-          DRY_RUN="${{ github.event.inputs.dry_run || 'false' }}"
-          echo "dry_run=${DRY_RUN}"
-
           if [ -z "${SYNC_TOKEN:-}" ]; then
             echo "SYNC_TOKEN secret is missing."
             exit 1
@@ -56,6 +48,7 @@ jobs:
           echo "Found ${TARGET_COUNT} target(s)."
 
           BOILER_SHA="$(git rev-parse HEAD)"
+          BOILER_SHORT_SHA="$(git rev-parse --short HEAD)"
           echo "Boiler SHA: ${BOILER_SHA}"
 
           for i in $(seq 0 $((TARGET_COUNT - 1))); do
@@ -74,8 +67,12 @@ jobs:
 
             pushd "${WORKDIR}/child" >/dev/null
 
-            # Ensure we're on main (adjust if child default branch differs)
-            git checkout main || git checkout -b main
+            # Ensure we're on main
+            git checkout main
+
+            # Create a new sync branch from main
+            SYNC_BRANCH="boiler-sync/${BOILER_SHORT_SHA}"
+            git checkout -b "${SYNC_BRANCH}"
 
             # Remove existing boiler folder (managed area)
             rm -rf boiler
@@ -109,17 +106,40 @@ jobs:
             git add -A
 
             if git diff --cached --quiet; then
-              echo "No changes to commit for ${REPO}"
+              echo "No changes to commit for ${REPO}, skipping PR."
             else
               git config user.name "boiler-sync-bot"
               git config user.email "boiler-sync-bot@users.noreply.github.com"
               git commit -m "Sync from orgpb/boiler@${BOILER_SHA}"
 
-              if [ "${DRY_RUN}" = "true" ]; then
-                echo "DRY RUN: would push to ${REPO}, but skipping git push."
+              # Push the sync branch to the child repo
+              git push origin "${SYNC_BRANCH}"
+              echo "Pushed branch '${SYNC_BRANCH}' to ${REPO}"
+
+              # Raise a Pull Request via GitHub API
+              PR_RESPONSE=$(curl -s -w "\n%{http_code}" \
+                -X POST \
+                -H "Authorization: Bearer ${SYNC_TOKEN}" \
+                -H "Accept: application/vnd.github+json" \
+                -H "X-GitHub-Api-Version: 2022-11-28" \
+                "https://api.github.com/repos/${REPO}/pulls" \
+                -d "{
+                  \"title\": \"Sync from orgpb/boiler@${BOILER_SHORT_SHA}\",
+                  \"body\": \"Automated sync from [orgpb/boiler@${BOILER_SHA}](https://github.com/orgpb/boiler/commit/${BOILER_SHA}).\n\nPlease review and merge to apply the latest boiler updates.\",
+                  \"head\": \"${SYNC_BRANCH}\",
+                  \"base\": \"main\"
+                }")
+
+              PR_HTTP_CODE=$(echo "${PR_RESPONSE}" | tail -n1)
+              PR_BODY=$(echo "${PR_RESPONSE}" | head -n-1)
+
+              if [ "${PR_HTTP_CODE}" = "201" ]; then
+                PR_URL=$(echo "${PR_BODY}" | grep -o '"html_url": *"[^"]*"' | head -1 | sed 's/"html_url": *"\(.*\)"/\1/')
+                echo "Pull Request created for ${REPO}: ${PR_URL}"
               else
-                git push origin main
-                echo "Pushed sync to ${REPO}"
+                echo "ERROR: Failed to create PR for ${REPO}. HTTP ${PR_HTTP_CODE}"
+                echo "${PR_BODY}"
+                exit 1
               fi
             fi
             popd >/dev/null

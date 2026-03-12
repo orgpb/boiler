@@ -1,0 +1,205 @@
+name: Create Child Repository
+
+on:
+  workflow_dispatch:
+    inputs:
+      repo_name:
+        description: 'Repository name'
+        required: true
+        type: string
+      config:
+        description: 'Configuration to apply'
+        required: true
+        type: choice
+        options:
+          - IBU
+          - Brands
+          - HCP
+      root_folder:
+        description: 'Root folder name inside the child repo (e.g. "uk", "it", "co"). Leave empty to copy at root level.'
+        required: false
+        type: string
+        default: ''
+
+jobs:
+  create-repo:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    
+    steps:
+      - name: Checkout template repo (this repo) to get configs/
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+          
+      - name: Create repo from template
+        id: create-repo
+        env:
+          GH_TOKEN: ${{ secrets.GH_TOKEN_PAT }}
+        run: |
+          REPO_NAME="${{ inputs.repo_name }}"
+          OWNER="orgpb"
+          VISIBILITY="private"
+    
+          if gh repo view "$OWNER/$REPO_NAME" &>/dev/null; then
+            echo "Repository already exists: $OWNER/$REPO_NAME"
+            exit 1
+          fi
+    
+          gh repo create "$OWNER/$REPO_NAME" \
+            --template "shripaddesaid/config-boilerplate" \
+            --$VISIBILITY \
+            --clone=false
+            REPO_URL="https://github.com/$OWNER/$REPO_NAME"
+            echo "repo_url=$REPO_URL" >> $GITHUB_OUTPUT
+            echo "✅ Created repository: $REPO_URL"
+      
+      - name: Clone newly created repository
+        env:
+          GH_TOKEN: ${{ secrets.GH_TOKEN_PAT }}
+        run: |
+          OWNER="${{ inputs.owner }}"
+          REPO_NAME="${{ inputs.repo_name }}"
+
+          for i in {1..30}; do
+            if git ls-remote --exit-code --heads "https://github.com/$OWNER/$REPO.git" main >/dev/null 2>&1; then
+              echo "main is ready"
+              break
+            fi
+            echo "waiting for main..."
+            sleep 2
+          done
+          # Clone the newly created repository
+          gh repo clone "$OWNER/$REPO_NAME" new-repo
+          
+          # Configure git
+          cd new-repo
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+      
+      - name: Apply configuration
+        id: apply-config
+        env:
+          CONFIG: ${{ inputs.config }}
+          ROOT_FOLDER: ${{ inputs.root_folder }}
+        run: |
+          set -e
+
+          OVERLAY_DIR="configs/$CONFIG/overlay"
+          DELETE_FILE="configs/$CONFIG/delete.txt"
+
+          cd new-repo
+
+          # Copy overlay files if they exist
+          if [ -d "../$OVERLAY_DIR" ]; then
+            if [ -n "$ROOT_FOLDER" ]; then
+              # User provided a root folder — copy files under that folder
+              echo "📦 Copying overlay files from configs/$CONFIG/overlay/ into '$ROOT_FOLDER/'"
+              mkdir -p "$ROOT_FOLDER"
+              cp -r ../$OVERLAY_DIR/. "$ROOT_FOLDER/"
+              echo "✅ Overlay files copied into '$ROOT_FOLDER/'"
+            else
+              # No root folder — copy files at root level (existing behaviour)
+              echo "📦 Copying overlay files from configs/$CONFIG/overlay/ to root"
+              cp -r ../$OVERLAY_DIR/. .
+              echo "✅ Overlay files copied to root"
+            fi
+          else
+            echo "ℹ️  No overlay directory found at configs/$CONFIG/overlay/"
+          fi
+          
+          # Process delete.txt if it exists
+          if [ -f "../$DELETE_FILE" ]; then
+            echo "🗑️  Processing deletion list from configs/$CONFIG/delete.txt"
+            
+            while IFS= read -r path || [ -n "$path" ]; do
+              # Skip empty lines and comments
+              [[ -z "$path" || "$path" =~ ^[[:space:]]*# ]] && continue
+              
+              # Trim whitespace
+              path=$(echo "$path" | xargs)
+              
+              # Guardrails: prevent dangerous deletions
+              if [[ "$path" == .git/* || "$path" == .git ]]; then
+                echo "⚠️  Blocked: Cannot delete .git directory or its contents: $path"
+                continue
+              fi
+              
+              if [[ "$path" == *../* || "$path" == ../* ]]; then
+                echo "⚠️  Blocked: Path traversal not allowed: $path"
+                continue
+              fi
+              
+              if [[ "$path" == .github/workflows/* ]]; then
+                echo "⚠️  Warning: Skipping deletion of workflow file: $path"
+                continue
+              fi
+              
+              # Delete the file or directory
+              if [ -e "$path" ]; then
+                rm -rf "$path"
+                echo "  ✓ Deleted: $path"
+              else
+                echo "  ℹ️  Not found (skipping): $path"
+              fi
+            done < "../$DELETE_FILE"
+            
+            echo "✅ Deletion processing complete"
+          else
+            echo "ℹ️  No delete.txt found at configs/$CONFIG/delete.txt"
+          fi
+          
+          # Check if there are changes to commit
+          if [[ -n $(git status --porcelain) ]]; then
+            echo "has_changes=true" >> $GITHUB_OUTPUT
+          else
+            echo "has_changes=false" >> $GITHUB_OUTPUT
+          fi
+      
+      - name: Authenticate git for pushes (use gh credential helper)
+        env:
+          GH_TOKEN: ${{ secrets.GH_TOKEN_PAT }}
+        run: |
+          gh auth status
+          gh auth setup-git
+    
+      - name: Commit and push changes
+        env:
+          GH_TOKEN: ${{ secrets.GH_TOKEN_PAT }}
+          CONFIG: ${{ inputs.config }}
+        run: |
+          cd new-repo
+          
+          if [[ "${{ steps.apply-config.outputs.has_changes }}" == "true" ]]; then
+            git add .
+            git commit -m "Apply config $CONFIG"
+            git push origin HEAD
+            echo "✅ Changes committed and pushed"
+          else
+            echo "ℹ️  No changes to commit - configuration already matches"
+          fi
+      
+      - name: Write job summary
+        if: always()
+        run: |
+          REPO_URL="${{ steps.create-repo.outputs.repo_url }}"
+          CONFIG="${{ inputs.config }}"
+          
+          echo "## 🎉 Repository Created Successfully" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Repository:** [$REPO_URL]($REPO_URL)" >> $GITHUB_STEP_SUMMARY
+          echo "**Configuration:** $CONFIG" >> $GITHUB_STEP_SUMMARY
+          echo "**Visibility:** ${{ inputs.visibility }}" >> $GITHUB_STEP_SUMMARY
+          if [[ -n "${{ inputs.root_folder }}" ]]; then
+            echo "**Root Folder:** \`${{ inputs.root_folder }}\`" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "**Root Folder:** *(root level)*" >> $GITHUB_STEP_SUMMARY
+          fi
+          echo "" >> $GITHUB_STEP_SUMMARY
+          
+          if [[ "${{ steps.apply-config.outputs.has_changes }}" == "true" ]]; then
+            echo "✅ Configuration applied and changes committed" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "ℹ️  No changes needed - configuration already matches" >> $GITHUB_STEP_SUMMARY
+          fi

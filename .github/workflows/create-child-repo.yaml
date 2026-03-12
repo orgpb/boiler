@@ -59,17 +59,18 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GH_TOKEN_PAT }}
         run: |
-          OWNER="${{ inputs.owner }}"
+          OWNER="orgpb"
           REPO_NAME="${{ inputs.repo_name }}"
 
           for i in {1..30}; do
-            if git ls-remote --exit-code --heads "https://github.com/$OWNER/$REPO.git" main >/dev/null 2>&1; then
-              echo "main is ready"
+            if git ls-remote --exit-code --heads "https://x-access-token:$GH_TOKEN@github.com/$OWNER/$REPO_NAME.git" main >/dev/null 2>&1; then
+              echo "✅ main branch is ready"
               break
             fi
-            echo "waiting for main..."
+            echo "⏳ Waiting for main branch to be ready... attempt $i/30"
             sleep 2
           done
+
           # Clone the newly created repository
           gh repo clone "$OWNER/$REPO_NAME" new-repo
           
@@ -161,9 +162,9 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GH_TOKEN_PAT }}
         run: |
-          gh auth status
           gh auth setup-git
-    
+          echo "✅ Git authentication configured"
+
       - name: Commit and push changes
         env:
           GH_TOKEN: ${{ secrets.GH_TOKEN_PAT }}
